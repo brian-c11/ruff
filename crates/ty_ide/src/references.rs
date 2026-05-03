@@ -9,10 +9,32 @@
 //! scope or within classes, are visible outside of the module. Finding
 //! all references to these externally-visible symbols therefore requires
 //! an expensive search of all source files in the workspace.
+//!
+//! Reference matching intentionally works on semantic definition keys, not on
+//! the navigation targets that are returned to the LSP client for
+//! goto-definition. Navigation targets are a presentation format: they answer
+//! "where should the editor jump?" and may be affected by focus ranges, full
+//! ranges, stub mapping, or other UI-oriented choices. References need a
+//! different answer: "does this occurrence resolve to the same symbol?".
+//!
+//! The flow is:
+//! 1. Resolve the symbol under the cursor to raw semantic definitions.
+//! 2. Apply declaration policy, then convert the declarations into
+//!    [`DefinitionMatches`], keeping the
+//!    semantic key plus the source ranges needed by find-references.
+//! 3. Visit candidate occurrences and resolve each occurrence the same way.
+//! 4. Treat the occurrence as a match when the two identity sets intersect.
+//!
+//! This differs from the old approach, which converted definitions to
+//! `DefinitionTargets`/`NavigationTargets` early and compared those navigation
+//! targets. Keeping references on semantic keys avoids using an editor
+//! jump location as a proxy for symbol equality, while still retaining just
+//! enough range/category information for declaration skipping and parameter
+//! keyword-argument handling.
 
-use crate::goto::GotoTarget;
-use crate::{Db, NavigationTarget, NavigationTargets, ReferenceKind, ReferenceTarget};
-use ruff_db::files::File;
+use crate::goto::{Definitions, GotoTarget};
+use crate::{Db, ReferenceKind, ReferenceTarget};
+use ruff_db::files::{File, FileRange};
 use ruff_python_ast::find_node::{CoveringNode, covering_node};
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{
@@ -20,7 +42,7 @@ use ruff_python_ast::{
     visitor::source_order::{SourceOrderVisitor, TraversalSignal},
 };
 use ruff_text_size::{Ranged, TextRange};
-use ty_python_semantic::{ImportAliasResolution, SemanticModel};
+use ty_python_semantic::{ImportAliasResolution, ResolvedDefinition, SemanticModel};
 
 /// Mode for references search behavior
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +91,105 @@ impl ReferencesMode {
     }
 }
 
+/// One resolved definition that a candidate occurrence can match against,
+/// together with cached metadata used by find-references.
+///
+/// The [`ResolvedDefinition`] is the semantic identity. The focus range is
+/// derived from it once so sorting and parameter-owner checks do not repeatedly
+/// load the parsed module for semantic definitions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DefinitionMatch<'db> {
+    /// The resolved definition used to decide whether two occurrences refer to
+    /// the same symbol.
+    resolved_definition: ResolvedDefinition<'db>,
+
+    /// The narrow source range that identifies the symbol itself.
+    ///
+    /// For [`ResolvedDefinition::Definition`], this is
+    /// [`ty_python_core::definition::Definition::focus_range`]. For modules and
+    /// range-backed definitions, this is the only available range.
+    focus_range: FileRange,
+}
+
+impl<'db> DefinitionMatch<'db> {
+    fn from_resolved_definition(
+        db: &'db dyn ty_python_semantic::Db,
+        resolved_definition: ResolvedDefinition<'db>,
+    ) -> Self {
+        let focus_range = match resolved_definition {
+            ResolvedDefinition::Definition(definition) => {
+                let definition_file = definition.file(db);
+                let module = ruff_db::parsed::parsed_module(db, definition_file).load(db);
+                definition.focus_range(db, &module)
+            }
+            ResolvedDefinition::Module(file) => FileRange::new(file, Default::default()),
+            ResolvedDefinition::FileWithRange(file_range) => file_range,
+        };
+
+        Self {
+            resolved_definition,
+            focus_range,
+        }
+    }
+
+    fn resolved_definition(&self) -> ResolvedDefinition<'db> {
+        self.resolved_definition
+    }
+
+    fn focus_range(&self) -> FileRange {
+        self.focus_range
+    }
+}
+
+/// The resolved definitions for one candidate occurrence in a reference search.
+///
+/// Most symbols resolve to a single target, but overload groups, properties,
+/// imports, and other compound cases can produce multiple co-definitions. A
+/// candidate matches when this set intersects with the original target's set by
+/// [`ResolvedDefinition`].
+#[derive(Debug, Clone)]
+struct DefinitionMatches<'db> {
+    /// The semantic definitions this occurrence resolves to.
+    targets: smallvec::SmallVec<[DefinitionMatch<'db>; 1]>,
+}
+
+impl<'db> DefinitionMatches<'db> {
+    fn from_resolved_definitions(
+        db: &'db dyn ty_python_semantic::Db,
+        definitions: Vec<ResolvedDefinition<'db>>,
+    ) -> Self {
+        let mut targets = definitions
+            .into_iter()
+            .map(|resolved_definition| {
+                DefinitionMatch::from_resolved_definition(db, resolved_definition)
+            })
+            .collect::<Vec<_>>();
+
+        targets.sort_by_key(|target| {
+            let focus = target.focus_range();
+            (focus.file(), focus.range().start())
+        });
+        targets.dedup();
+
+        Self {
+            targets: targets.into(),
+        }
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, DefinitionMatch<'db>> {
+        self.targets.iter()
+    }
+}
+
+impl<'db> Definitions<'db> {
+    fn into_definition_matches(
+        self,
+        db: &'db dyn ty_python_semantic::Db,
+    ) -> DefinitionMatches<'db> {
+        DefinitionMatches::from_resolved_definitions(db, self.0)
+    }
+}
+
 /// Find all references to a symbol at the given position.
 /// Search for references across all files in the project.
 pub(crate) fn references(
@@ -79,8 +200,9 @@ pub(crate) fn references(
 ) -> Option<Vec<ReferenceTarget>> {
     let model = SemanticModel::new(db, file);
     let target_definitions = goto_target
-        .get_definition_targets(&model, mode.to_import_alias_resolution())?
-        .declaration_targets(&model, goto_target)?;
+        .definitions(&model, mode.to_import_alias_resolution())?
+        .goto_declaration(&model, goto_target)?
+        .into_definition_matches(db);
 
     // Extract the target text from the goto target for fast comparison
     let target_text = goto_target.to_string()?;
@@ -164,7 +286,7 @@ pub(crate) fn references(
 fn references_for_parameter_keyword_arguments_across_files(
     db: &dyn Db,
     file: File,
-    target_definitions: &NavigationTargets,
+    target_definitions: &DefinitionMatches<'_>,
     target_text: &str,
     mode: ReferencesMode,
     references: &mut Vec<ReferenceTarget>,
@@ -193,7 +315,7 @@ fn references_for_parameter_keyword_arguments_across_files(
 fn references_for_keyword_arguments_in_file(
     db: &dyn Db,
     file: File,
-    target_definitions: &NavigationTargets,
+    target_definitions: &DefinitionMatches<'_>,
     target_text: &str,
     mode: ReferencesMode,
     references: &mut Vec<ReferenceTarget>,
@@ -264,19 +386,20 @@ fn source_contains_keyword_argument_candidate(source: &str, name: &str) -> bool 
     false
 }
 
-/// Return true if the declaration-target sets intersect.
+/// Return true if the semantic identity sets intersect.
 ///
-/// A symbol can resolve to multiple declaration targets (for example, overload groups or an
-/// import binding plus its underlying definition). Intersection semantics avoid missing valid
-/// references/renames when target ordering differs.
-fn navigation_targets_intersect(
-    target_definitions: &NavigationTargets,
-    current_targets: &NavigationTargets,
+/// A symbol can resolve to multiple definitions (for example, overload groups,
+/// property getter/setter co-definitions, or an import binding plus its
+/// underlying definition). Intersection semantics avoid missing valid
+/// references/renames when target ordering differs or when one occurrence
+/// exposes only part of the co-definition set.
+fn definition_identities_intersect(
+    target_definitions: &DefinitionMatches<'_>,
+    current_targets: &DefinitionMatches<'_>,
 ) -> bool {
     target_definitions.iter().any(|target_definition| {
         current_targets.iter().any(|current_target| {
-            current_target.file == target_definition.file
-                && current_target.focus_range == target_definition.focus_range
+            current_target.resolved_definition() == target_definition.resolved_definition()
         })
     })
 }
@@ -286,7 +409,7 @@ fn navigation_targets_intersect(
 fn references_for_file(
     db: &dyn Db,
     file: File,
-    target_definitions: &NavigationTargets,
+    target_definitions: &DefinitionMatches,
     target_text: &str,
     mode: ReferencesMode,
     references: &mut Vec<ReferenceTarget>,
@@ -332,22 +455,19 @@ fn is_symbol_externally_visible(goto_target: &GotoTarget<'_>) -> bool {
 /// when the owning callable is visible outside of the current module.
 fn parameter_owner_is_externally_visible(
     db: &dyn Db,
-    target_definitions: &NavigationTargets,
+    target_definitions: &DefinitionMatches<'_>,
 ) -> bool {
     target_definitions
         .iter()
-        .any(|target| parameter_owner_is_externally_visible_for_target(db, target))
+        .any(|target| parameter_owner_is_externally_visible_for_target(db, target.focus_range()))
 }
 
-fn parameter_owner_is_externally_visible_for_target(
-    db: &dyn Db,
-    target: &NavigationTarget,
-) -> bool {
+fn parameter_owner_is_externally_visible_for_target(db: &dyn Db, target: FileRange) -> bool {
     let file = target.file();
     let parsed = ruff_db::parsed::parsed_module(db, file);
     let module = parsed.load(db);
 
-    let covering = covering_node(module.syntax().into(), target.focus_range());
+    let covering = covering_node(module.syntax().into(), target.range());
     let Ok(parameter_covering) =
         covering.find_last(|node| matches!(node, AnyNodeRef::Parameter(_)))
     else {
@@ -396,7 +516,7 @@ fn parameter_owner_is_externally_visible_for_target(
 struct LocalReferencesFinder<'a> {
     model: &'a SemanticModel<'a>,
     tokens: &'a Tokens,
-    target_definitions: &'a NavigationTargets,
+    target_definitions: &'a DefinitionMatches<'a>,
     references: &'a mut Vec<ReferenceTarget>,
     mode: ReferencesMode,
     target_text: &'a str,
@@ -538,7 +658,7 @@ impl<'a> SourceOrderVisitor<'a> for KeywordArgumentReferencesFinder<'a> {
     }
 }
 
-impl LocalReferencesFinder<'_> {
+impl<'a> LocalReferencesFinder<'a> {
     /// Check if we should include declarations based on the current mode
     fn should_include_declaration(&self) -> bool {
         matches!(
@@ -550,7 +670,7 @@ impl LocalReferencesFinder<'_> {
         )
     }
 
-    /// Helper method to check identifier references for declarations
+    /// Helper method to check identifier references.
     fn check_identifier_reference(&mut self, identifier: &ast::Identifier) {
         // Quick text-based check first
         if identifier.id != self.target_text {
@@ -563,39 +683,39 @@ impl LocalReferencesFinder<'_> {
         self.check_reference_from_covering_node(&covering_node);
     }
 
-    /// Returns true if the covering node's resolved definitions intersect `target_definitions`.
-    fn matches_target_definitions(&self, covering_node: &CoveringNode<'_>) -> bool {
+    /// Returns the covering node's resolved definitions.
+    fn definitions_for_covering_node(
+        &self,
+        covering_node: &CoveringNode<'_>,
+    ) -> Option<DefinitionMatches<'a>> {
         // Use the start of the covering node as the offset. Any offset within
         // the node is fine here. Offsets matter only for import statements
         // where the identifier might be a multi-part module name.
         let offset = covering_node.node().start();
-        let Some(goto_target) =
-            GotoTarget::from_covering_node(self.model, covering_node, offset, self.tokens)
-        else {
-            return false;
-        };
+        let goto_target =
+            GotoTarget::from_covering_node(self.model, covering_node, offset, self.tokens)?;
 
-        // Get the definitions for this goto target
-        let Some(current_definitions) = goto_target
-            .get_definition_targets(self.model, self.mode.to_import_alias_resolution())
-            .and_then(|definitions| definitions.declaration_targets(self.model, &goto_target))
-        else {
-            return false;
-        };
+        let definitions = goto_target
+            .definitions(self.model, self.mode.to_import_alias_resolution())?
+            .goto_declaration(self.model, &goto_target)?;
 
-        // Check if any of the current definitions match our target definitions
-        navigation_targets_intersect(self.target_definitions, &current_definitions)
+        Some(definitions.into_definition_matches(self.model.db()))
     }
 
     /// Pushes a reference target when the covering node resolves to any target definition
     fn check_reference_from_covering_node(&mut self, covering_node: &CoveringNode<'_>) {
-        if self.matches_target_definitions(covering_node) {
-            // Determine if this is a read or write reference
-            let kind = self.determine_reference_kind(covering_node);
-            let target =
-                ReferenceTarget::new(self.model.file(), covering_node.node().range(), kind);
-            self.references.push(target);
+        let Some(current_definitions) = self.definitions_for_covering_node(covering_node) else {
+            return;
+        };
+
+        // Check if any of the current definitions match our target definitions
+        if !definition_identities_intersect(self.target_definitions, &current_definitions) {
+            return;
         }
+
+        let kind = self.determine_reference_kind(covering_node);
+        let target = ReferenceTarget::new(self.model.file(), covering_node.node().range(), kind);
+        self.references.push(target);
     }
 
     /// Determine whether a reference is a read or write operation based on its context
@@ -619,59 +739,65 @@ impl LocalReferencesFinder<'_> {
                 }
                 AnyNodeRef::StmtAnnAssign(ann_assign)
                     // Check if our node is the target (left side) of annotated assignment
-                    if Self::expr_contains_range(&ann_assign.target, covering_node.node().range()) => {
-                        return ReferenceKind::Write;
-                    }
+                    if Self::expr_contains_range(&ann_assign.target, covering_node.node().range()) =>
+                {
+                    return ReferenceKind::Write;
+                }
                 AnyNodeRef::StmtAugAssign(aug_assign)
                     // Check if our node is the target (left side) of augmented assignment
-                    if Self::expr_contains_range(&aug_assign.target, covering_node.node().range()) => {
-                        return ReferenceKind::Write;
-                    }
+                    if Self::expr_contains_range(&aug_assign.target, covering_node.node().range()) =>
+                {
+                    return ReferenceKind::Write;
+                }
                 // For loop targets are writes
                 AnyNodeRef::StmtFor(for_stmt)
-                    if Self::expr_contains_range(&for_stmt.target, covering_node.node().range()) => {
-                        return ReferenceKind::Write;
-                    }
+                    if Self::expr_contains_range(&for_stmt.target, covering_node.node().range()) =>
+                {
+                    return ReferenceKind::Write;
+                }
                 // With statement targets are writes
                 AnyNodeRef::WithItem(with_item) => {
-                    if let Some(optional_vars) = &with_item.optional_vars {
-                        if Self::expr_contains_range(optional_vars, covering_node.node().range()) {
-                            return ReferenceKind::Write;
-                        }
+                    if let Some(optional_vars) = &with_item.optional_vars
+                        && Self::expr_contains_range(optional_vars, covering_node.node().range())
+                    {
+                        return ReferenceKind::Write;
                     }
                 }
                 // Exception handler names are writes
                 AnyNodeRef::ExceptHandlerExceptHandler(handler) => {
-                    if let Some(name) = &handler.name {
-                        if Self::node_contains_range(
+                    if let Some(name) = &handler.name
+                        && Self::node_contains_range(
                             AnyNodeRef::from(name),
                             covering_node.node().range(),
-                        ) {
-                            return ReferenceKind::Write;
-                        }
+                        )
+                    {
+                        return ReferenceKind::Write;
                     }
                 }
                 AnyNodeRef::StmtFunctionDef(func)
                     if Self::node_contains_range(
                         AnyNodeRef::from(&func.name),
                         covering_node.node().range(),
-                    ) => {
-                        return ReferenceKind::Other;
-                    }
+                    ) =>
+                {
+                    return ReferenceKind::Other;
+                }
                 AnyNodeRef::StmtClassDef(class)
                     if Self::node_contains_range(
                         AnyNodeRef::from(&class.name),
                         covering_node.node().range(),
-                    ) => {
-                        return ReferenceKind::Other;
-                    }
+                    ) =>
+                {
+                    return ReferenceKind::Other;
+                }
                 AnyNodeRef::Parameter(param)
                     if Self::node_contains_range(
                         AnyNodeRef::from(&param.name),
                         covering_node.node().range(),
-                    ) => {
-                        return ReferenceKind::Other;
-                    }
+                    ) =>
+                {
+                    return ReferenceKind::Other;
+                }
                 AnyNodeRef::StmtGlobal(_) | AnyNodeRef::StmtNonlocal(_) => {
                     return ReferenceKind::Other;
                 }
