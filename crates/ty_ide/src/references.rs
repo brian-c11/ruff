@@ -19,8 +19,8 @@
 //!
 //! The flow is:
 //! 1. Resolve the symbol under the cursor to raw semantic definitions.
-//! 2. Apply declaration policy, then convert the declarations into
-//!    [`DefinitionMatches`], keeping the
+//! 2. Apply goto-declaration policy, then convert the resulting definitions
+//!    into [`DefinitionMatches`], keeping the
 //!    semantic key plus the source ranges needed by find-references.
 //! 3. Visit candidate occurrences and resolve each occurrence the same way.
 //! 4. Treat the occurrence as a match when the two identity sets intersect.
@@ -41,7 +41,7 @@ use ruff_python_ast::{
     self as ast, AnyNodeRef,
     visitor::source_order::{SourceOrderVisitor, TraversalSignal},
 };
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::Ranged;
 use ty_python_semantic::{ImportAliasResolution, ResolvedDefinition, SemanticModel};
 
 /// Mode for references search behavior
@@ -91,105 +91,6 @@ impl ReferencesMode {
     }
 }
 
-/// One resolved definition that a candidate occurrence can match against,
-/// together with cached metadata used by find-references.
-///
-/// The [`ResolvedDefinition`] is the semantic identity. The focus range is
-/// derived from it once so sorting and parameter-owner checks do not repeatedly
-/// load the parsed module for semantic definitions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DefinitionMatch<'db> {
-    /// The resolved definition used to decide whether two occurrences refer to
-    /// the same symbol.
-    resolved_definition: ResolvedDefinition<'db>,
-
-    /// The narrow source range that identifies the symbol itself.
-    ///
-    /// For [`ResolvedDefinition::Definition`], this is
-    /// [`ty_python_core::definition::Definition::focus_range`]. For modules and
-    /// range-backed definitions, this is the only available range.
-    focus_range: FileRange,
-}
-
-impl<'db> DefinitionMatch<'db> {
-    fn from_resolved_definition(
-        db: &'db dyn ty_python_semantic::Db,
-        resolved_definition: ResolvedDefinition<'db>,
-    ) -> Self {
-        let focus_range = match resolved_definition {
-            ResolvedDefinition::Definition(definition) => {
-                let definition_file = definition.file(db);
-                let module = ruff_db::parsed::parsed_module(db, definition_file).load(db);
-                definition.focus_range(db, &module)
-            }
-            ResolvedDefinition::Module(file) => FileRange::new(file, Default::default()),
-            ResolvedDefinition::FileWithRange(file_range) => file_range,
-        };
-
-        Self {
-            resolved_definition,
-            focus_range,
-        }
-    }
-
-    fn resolved_definition(&self) -> ResolvedDefinition<'db> {
-        self.resolved_definition
-    }
-
-    fn focus_range(&self) -> FileRange {
-        self.focus_range
-    }
-}
-
-/// The resolved definitions for one candidate occurrence in a reference search.
-///
-/// Most symbols resolve to a single target, but overload groups, properties,
-/// imports, and other compound cases can produce multiple co-definitions. A
-/// candidate matches when this set intersects with the original target's set by
-/// [`ResolvedDefinition`].
-#[derive(Debug, Clone)]
-struct DefinitionMatches<'db> {
-    /// The semantic definitions this occurrence resolves to.
-    targets: smallvec::SmallVec<[DefinitionMatch<'db>; 1]>,
-}
-
-impl<'db> DefinitionMatches<'db> {
-    fn from_resolved_definitions(
-        db: &'db dyn ty_python_semantic::Db,
-        definitions: Vec<ResolvedDefinition<'db>>,
-    ) -> Self {
-        let mut targets = definitions
-            .into_iter()
-            .map(|resolved_definition| {
-                DefinitionMatch::from_resolved_definition(db, resolved_definition)
-            })
-            .collect::<Vec<_>>();
-
-        targets.sort_by_key(|target| {
-            let focus = target.focus_range();
-            (focus.file(), focus.range().start())
-        });
-        targets.dedup();
-
-        Self {
-            targets: targets.into(),
-        }
-    }
-
-    fn iter(&self) -> std::slice::Iter<'_, DefinitionMatch<'db>> {
-        self.targets.iter()
-    }
-}
-
-impl<'db> Definitions<'db> {
-    fn into_definition_matches(
-        self,
-        db: &'db dyn ty_python_semantic::Db,
-    ) -> DefinitionMatches<'db> {
-        DefinitionMatches::from_resolved_definitions(db, self.0)
-    }
-}
-
 /// Find all references to a symbol at the given position.
 /// Search for references across all files in the project.
 pub(crate) fn references(
@@ -201,8 +102,11 @@ pub(crate) fn references(
     let model = SemanticModel::new(db, file);
     let target_definitions = goto_target
         .definitions(&model, mode.to_import_alias_resolution())?
-        .goto_declaration(&model, goto_target)?
-        .into_definition_matches(db);
+        .goto_declaration(&model, goto_target)?;
+    let target_definitions = DefinitionMatches::new(
+        FileRange::new(file, goto_target.range()),
+        target_definitions,
+    );
 
     // Extract the target text from the goto target for fast comparison
     let target_text = goto_target.to_string()?;
@@ -386,24 +290,6 @@ fn source_contains_keyword_argument_candidate(source: &str, name: &str) -> bool 
     false
 }
 
-/// Return true if the semantic identity sets intersect.
-///
-/// A symbol can resolve to multiple definitions (for example, overload groups,
-/// property getter/setter co-definitions, or an import binding plus its
-/// underlying definition). Intersection semantics avoid missing valid
-/// references/renames when target ordering differs or when one occurrence
-/// exposes only part of the co-definition set.
-fn definition_identities_intersect(
-    target_definitions: &DefinitionMatches<'_>,
-    current_targets: &DefinitionMatches<'_>,
-) -> bool {
-    target_definitions.iter().any(|target_definition| {
-        current_targets.iter().any(|current_target| {
-            current_target.resolved_definition() == target_definition.resolved_definition()
-        })
-    })
-}
-
 /// Find all references to a local symbol within the current file.
 /// The behavior depends on the provided mode.
 fn references_for_file(
@@ -459,7 +345,7 @@ fn parameter_owner_is_externally_visible(
 ) -> bool {
     target_definitions
         .iter()
-        .any(|target| parameter_owner_is_externally_visible_for_target(db, target.focus_range()))
+        .any(|target| parameter_owner_is_externally_visible_for_target(db, target.focus_range(db)))
 }
 
 fn parameter_owner_is_externally_visible_for_target(db: &dyn Db, target: FileRange) -> bool {
@@ -512,6 +398,107 @@ fn parameter_owner_is_externally_visible_for_target(db: &dyn Db, target: FileRan
     matches!(owner, Some(AnyNodeRef::StmtFunctionDef(_)))
 }
 
+/// The resolved definitions for one candidate occurrence in a reference search.
+///
+/// Most symbols resolve to a single target, but overload groups, properties,
+/// imports, and other compound cases can produce multiple co-definitions. A
+/// candidate matches when this set intersects with the original target's set by
+/// [`ResolvedDefinition`].
+#[derive(Debug, Clone)]
+struct DefinitionMatches<'db> {
+    /// The range of the occurrence that produced these targets.
+    ///
+    /// This is not the declaration range. It is the syntax range currently being
+    /// visited, and is used to decide whether a store occurrence is the
+    /// declaration that should be skipped in `ReferencesSkipDeclaration` mode.
+    origin: FileRange,
+
+    /// The semantic definitions this occurrence resolves to.
+    targets: Vec<ResolvedDefinition<'db>>,
+}
+
+impl<'db> DefinitionMatches<'db> {
+    fn new(origin: FileRange, definitions: Definitions<'db>) -> Self {
+        Self {
+            origin,
+            targets: definitions.0,
+        }
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, ResolvedDefinition<'db>> {
+        self.targets.iter()
+    }
+
+    /// Return true if the semantic identity sets intersect.
+    ///
+    /// A symbol can resolve to multiple definitions (for example, overload groups,
+    /// property getter/setter co-definitions, or an import binding plus its
+    /// underlying definition). Intersection semantics avoid missing valid
+    /// references/renames when target ordering differs or when one occurrence
+    /// exposes only part of the co-definition set.
+    fn intersects(&self, other: &DefinitionMatches<'_>) -> bool {
+        self.iter()
+            .any(|target_definition| other.targets.contains(target_definition))
+    }
+
+    fn declarations(
+        &self,
+        db: &'db dyn ty_python_semantic::Db,
+    ) -> impl Iterator<Item = &ResolvedDefinition<'db>> {
+        let has_semantic_declaration = self
+            .targets
+            .iter()
+            .any(|target| target.category(db).is_declaration());
+        let first_binding = self
+            .targets
+            .iter()
+            .filter(|target| target.category(db).is_binding())
+            .min_by_key(|target| {
+                let focus = target.focus_range(db);
+                (focus.file(), focus.range().start())
+            });
+
+        self.targets.iter().filter(move |target| {
+            if has_semantic_declaration {
+                target.category(db).is_declaration()
+            } else {
+                first_binding.is_some_and(|first_binding| first_binding == *target)
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OccurrenceKind {
+    /// A syntactically clear reference.
+    Reference,
+    /// A syntactically clear declaration.
+    Declaration,
+    /// A store occurrence, which may be either the declaration or a later write.
+    Store,
+}
+
+impl OccurrenceKind {
+    fn to_reference_kind(self) -> ReferenceKind {
+        match self {
+            Self::Reference => ReferenceKind::Read,
+            Self::Declaration => ReferenceKind::Other,
+            Self::Store => ReferenceKind::Write,
+        }
+    }
+}
+
+impl From<ast::ExprContext> for OccurrenceKind {
+    fn from(ctx: ast::ExprContext) -> Self {
+        match ctx {
+            ast::ExprContext::Store => Self::Store,
+            ast::ExprContext::Load | ast::ExprContext::Del | ast::ExprContext::Invalid => {
+                Self::Reference
+            }
+        }
+    }
+}
+
 /// AST visitor to find all references to a specific symbol by comparing semantic definitions
 struct LocalReferencesFinder<'a> {
     model: &'a SemanticModel<'a>,
@@ -537,20 +524,22 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
                     return TraversalSignal::Traverse;
                 }
 
+                let kind = OccurrenceKind::from(name_expr.ctx);
                 let covering_node = CoveringNode::from_ancestors(self.ancestors.clone());
-                self.check_reference_from_covering_node(&covering_node);
+                self.check_covering_node(&covering_node, kind);
             }
             AnyNodeRef::ExprAttribute(attr_expr) => {
-                self.check_identifier_reference(&attr_expr.attr);
+                let kind = OccurrenceKind::from(attr_expr.ctx);
+                self.check_identifier(&attr_expr.attr, kind);
             }
             AnyNodeRef::StmtFunctionDef(func) if self.should_include_declaration() => {
-                self.check_identifier_reference(&func.name);
+                self.check_identifier_declaration(&func.name);
             }
             AnyNodeRef::StmtClassDef(class) if self.should_include_declaration() => {
-                self.check_identifier_reference(&class.name);
+                self.check_identifier_declaration(&class.name);
             }
             AnyNodeRef::Parameter(parameter) if self.should_include_declaration() => {
-                self.check_identifier_reference(&parameter.name);
+                self.check_identifier_declaration(&parameter.name);
             }
             AnyNodeRef::Keyword(keyword) => {
                 if let Some(arg) = &keyword.arg {
@@ -559,46 +548,42 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
             }
             AnyNodeRef::StmtGlobal(global_stmt) if self.should_include_declaration() => {
                 for name in &global_stmt.names {
-                    self.check_identifier_reference(name);
+                    self.check_identifier_declaration(name);
                 }
             }
             AnyNodeRef::StmtNonlocal(nonlocal_stmt) if self.should_include_declaration() => {
                 for name in &nonlocal_stmt.names {
-                    self.check_identifier_reference(name);
+                    self.check_identifier_declaration(name);
                 }
             }
-            AnyNodeRef::ExceptHandlerExceptHandler(handler)
-                if self.should_include_declaration() =>
-            {
+            AnyNodeRef::ExceptHandlerExceptHandler(handler) => {
                 if let Some(name) = &handler.name {
-                    self.check_identifier_reference(name);
+                    self.check_identifier(name, OccurrenceKind::Store);
                 }
             }
-            AnyNodeRef::PatternMatchAs(pattern_as) if self.should_include_declaration() => {
+            AnyNodeRef::PatternMatchAs(pattern_as) => {
                 if let Some(name) = &pattern_as.name {
-                    self.check_identifier_reference(name);
+                    self.check_identifier(name, OccurrenceKind::Store);
                 }
             }
-            AnyNodeRef::PatternMatchStar(pattern_star) if self.should_include_declaration() => {
+            AnyNodeRef::PatternMatchStar(pattern_star) => {
                 if let Some(name) = &pattern_star.name {
-                    self.check_identifier_reference(name);
+                    self.check_identifier(name, OccurrenceKind::Store);
                 }
             }
-            AnyNodeRef::PatternMatchMapping(pattern_mapping)
-                if self.should_include_declaration() =>
-            {
+            AnyNodeRef::PatternMatchMapping(pattern_mapping) => {
                 if let Some(rest_name) = &pattern_mapping.rest {
-                    self.check_identifier_reference(rest_name);
+                    self.check_identifier(rest_name, OccurrenceKind::Store);
                 }
             }
             AnyNodeRef::TypeParamParamSpec(param_spec) if self.should_include_declaration() => {
-                self.check_identifier_reference(&param_spec.name);
+                self.check_identifier_declaration(&param_spec.name);
             }
             AnyNodeRef::TypeParamTypeVarTuple(param_tuple) if self.should_include_declaration() => {
-                self.check_identifier_reference(&param_tuple.name);
+                self.check_identifier_declaration(&param_tuple.name);
             }
             AnyNodeRef::TypeParamTypeVar(param_var) if self.should_include_declaration() => {
-                self.check_identifier_reference(&param_var.name);
+                self.check_identifier_declaration(&param_var.name);
             }
             AnyNodeRef::ExprStringLiteral(string_expr) if self.should_include_declaration() => {
                 // Highlight the sub-AST of a string annotation
@@ -619,12 +604,12 @@ impl<'a> SourceOrderVisitor<'a> for LocalReferencesFinder<'a> {
             AnyNodeRef::Alias(alias) if self.should_include_declaration() => {
                 // Handle import alias declarations
                 if let Some(asname) = &alias.asname {
-                    self.check_identifier_reference(asname);
+                    self.check_identifier_declaration(asname);
                 }
                 // Only check the original name if it matches our target text
                 // This is for cases where we're renaming the imported symbol name itself
                 if alias.name.id == self.target_text {
-                    self.check_identifier_reference(&alias.name);
+                    self.check_identifier_declaration(&alias.name);
                 }
             }
             _ => {}
@@ -672,6 +657,15 @@ impl<'a> LocalReferencesFinder<'a> {
 
     /// Helper method to check identifier references.
     fn check_identifier_reference(&mut self, identifier: &ast::Identifier) {
+        self.check_identifier(identifier, OccurrenceKind::Reference);
+    }
+
+    /// Helper method to check identifier declarations.
+    fn check_identifier_declaration(&mut self, identifier: &ast::Identifier) {
+        self.check_identifier(identifier, OccurrenceKind::Declaration);
+    }
+
+    fn check_identifier(&mut self, identifier: &ast::Identifier, kind: OccurrenceKind) {
         // Quick text-based check first
         if identifier.id != self.target_text {
             return;
@@ -680,7 +674,7 @@ impl<'a> LocalReferencesFinder<'a> {
         let mut ancestors_with_identifier = self.ancestors.clone();
         ancestors_with_identifier.push(AnyNodeRef::from(identifier));
         let covering_node = CoveringNode::from_ancestors(ancestors_with_identifier);
-        self.check_reference_from_covering_node(&covering_node);
+        self.check_covering_node(&covering_node, kind);
     }
 
     /// Returns the covering node's resolved definitions.
@@ -699,123 +693,57 @@ impl<'a> LocalReferencesFinder<'a> {
             .definitions(self.model, self.mode.to_import_alias_resolution())?
             .goto_declaration(self.model, &goto_target)?;
 
-        Some(definitions.into_definition_matches(self.model.db()))
+        Some(DefinitionMatches::new(
+            FileRange::new(self.model.file(), goto_target.range()),
+            definitions,
+        ))
     }
 
-    /// Pushes a reference target when the covering node resolves to any target definition
-    fn check_reference_from_covering_node(&mut self, covering_node: &CoveringNode<'_>) {
+    /// Resolves `covering_node` and records it if it refers to the target symbol.
+    ///
+    /// `kind` records whether the syntax identifies the occurrence as a reference, declaration,
+    /// or store. Stores still need semantic filtering in `ReferencesSkipDeclaration` mode because
+    /// a store can be either the declaration or a later write.
+    fn check_covering_node(&mut self, covering_node: &CoveringNode<'_>, kind: OccurrenceKind) {
         let Some(current_definitions) = self.definitions_for_covering_node(covering_node) else {
             return;
         };
 
         // Check if any of the current definitions match our target definitions
-        if !definition_identities_intersect(self.target_definitions, &current_definitions) {
+        if !self.target_definitions.intersects(&current_definitions) {
             return;
         }
 
-        let kind = self.determine_reference_kind(covering_node);
-        let target = ReferenceTarget::new(self.model.file(), covering_node.node().range(), kind);
-        self.references.push(target);
-    }
+        if matches!(self.mode, ReferencesMode::ReferencesSkipDeclaration) {
+            let is_declaration = match kind {
+                OccurrenceKind::Reference => false,
+                OccurrenceKind::Declaration => true,
+                OccurrenceKind::Store => self.is_declaration_occurrence(&current_definitions),
+            };
 
-    /// Determine whether a reference is a read or write operation based on its context
-    fn determine_reference_kind(&self, covering_node: &CoveringNode<'_>) -> ReferenceKind {
-        // Reference kind is only meaningful for DocumentHighlights mode
-        if !matches!(self.mode, ReferencesMode::DocumentHighlights) {
-            return ReferenceKind::Other;
-        }
-
-        // Walk up the ancestors to find the context
-        for ancestor in self.ancestors.iter().rev() {
-            match ancestor {
-                // Assignment targets are writes
-                AnyNodeRef::StmtAssign(assign) => {
-                    // Check if our node is in the targets (left side) of assignment
-                    for target in &assign.targets {
-                        if Self::expr_contains_range(target, covering_node.node().range()) {
-                            return ReferenceKind::Write;
-                        }
-                    }
-                }
-                AnyNodeRef::StmtAnnAssign(ann_assign)
-                    // Check if our node is the target (left side) of annotated assignment
-                    if Self::expr_contains_range(&ann_assign.target, covering_node.node().range()) =>
-                {
-                    return ReferenceKind::Write;
-                }
-                AnyNodeRef::StmtAugAssign(aug_assign)
-                    // Check if our node is the target (left side) of augmented assignment
-                    if Self::expr_contains_range(&aug_assign.target, covering_node.node().range()) =>
-                {
-                    return ReferenceKind::Write;
-                }
-                // For loop targets are writes
-                AnyNodeRef::StmtFor(for_stmt)
-                    if Self::expr_contains_range(&for_stmt.target, covering_node.node().range()) =>
-                {
-                    return ReferenceKind::Write;
-                }
-                // With statement targets are writes
-                AnyNodeRef::WithItem(with_item) => {
-                    if let Some(optional_vars) = &with_item.optional_vars
-                        && Self::expr_contains_range(optional_vars, covering_node.node().range())
-                    {
-                        return ReferenceKind::Write;
-                    }
-                }
-                // Exception handler names are writes
-                AnyNodeRef::ExceptHandlerExceptHandler(handler) => {
-                    if let Some(name) = &handler.name
-                        && Self::node_contains_range(
-                            AnyNodeRef::from(name),
-                            covering_node.node().range(),
-                        )
-                    {
-                        return ReferenceKind::Write;
-                    }
-                }
-                AnyNodeRef::StmtFunctionDef(func)
-                    if Self::node_contains_range(
-                        AnyNodeRef::from(&func.name),
-                        covering_node.node().range(),
-                    ) =>
-                {
-                    return ReferenceKind::Other;
-                }
-                AnyNodeRef::StmtClassDef(class)
-                    if Self::node_contains_range(
-                        AnyNodeRef::from(&class.name),
-                        covering_node.node().range(),
-                    ) =>
-                {
-                    return ReferenceKind::Other;
-                }
-                AnyNodeRef::Parameter(param)
-                    if Self::node_contains_range(
-                        AnyNodeRef::from(&param.name),
-                        covering_node.node().range(),
-                    ) =>
-                {
-                    return ReferenceKind::Other;
-                }
-                AnyNodeRef::StmtGlobal(_) | AnyNodeRef::StmtNonlocal(_) => {
-                    return ReferenceKind::Other;
-                }
-                _ => {}
+            if is_declaration {
+                return;
             }
         }
 
-        // Default to read
-        ReferenceKind::Read
+        let target = ReferenceTarget::new(
+            self.model.file(),
+            covering_node.node().range(),
+            kind.to_reference_kind(),
+        );
+        self.references.push(target);
     }
 
-    /// Helper to check if a node contains a given range
-    fn node_contains_range(node: AnyNodeRef<'_>, range: TextRange) -> bool {
-        node.range().contains_range(range)
-    }
-
-    /// Helper to check if an expression contains a given range
-    fn expr_contains_range(expr: &ast::Expr, range: TextRange) -> bool {
-        expr.range().contains_range(range)
+    /// Returns true if this store occurrence is the declaration to omit.
+    fn is_declaration_occurrence(&self, current_definitions: &DefinitionMatches<'_>) -> bool {
+        self.target_definitions
+            .declarations(self.model.db())
+            .any(|target_declaration| {
+                let declaration_range = target_declaration.focus_range(self.model.db());
+                declaration_range.file() == current_definitions.origin.file()
+                    && declaration_range
+                        .range()
+                        .contains_range(current_definitions.origin.range())
+            })
     }
 }
