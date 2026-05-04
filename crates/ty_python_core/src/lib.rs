@@ -493,6 +493,37 @@ impl<'db> SemanticIndex<'db> {
         VisibleAncestorsIter::new(&self.scopes, scope)
     }
 
+    /// Returns the [`definition::Definition`] salsa ingredient(s) for `definition_key`, if any.
+    ///
+    /// There will only ever be >1 `Definition` associated with a `definition_key`
+    /// if the definition is created by a wildcard (`*`) import.
+    pub fn try_definitions(
+        &self,
+        definition_key: impl Into<DefinitionNodeKey>,
+    ) -> Option<&Definitions<'db>> {
+        self.definitions_by_node.get(&definition_key.into())
+    }
+
+    /// Returns the [`definition::Definition`] salsa ingredient for `definition_key`, if any.
+    ///
+    /// ## Panics
+    ///
+    /// If more than one definition is associated with the key and the
+    /// `debug_assertions` feature is enabled, this method will panic.
+    #[track_caller]
+    pub fn try_single_definition(
+        &self,
+        definition_key: impl Into<DefinitionNodeKey> + std::fmt::Debug + Copy,
+    ) -> Option<Definition<'db>> {
+        let definitions = self.try_definitions(definition_key)?;
+        debug_assert!(
+            definitions.len() <= 1,
+            "Expected at most one definition to be associated with AST node {definition_key:?} but found {}",
+            definitions.len()
+        );
+        definitions.first().copied()
+    }
+
     /// Returns the [`definition::Definition`] salsa ingredient(s) for `definition_key`.
     ///
     /// There will only ever be >1 `Definition` associated with a `definition_key`

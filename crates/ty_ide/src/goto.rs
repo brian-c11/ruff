@@ -243,9 +243,25 @@ pub(crate) enum GotoTarget<'a> {
 
 /// The resolved definitions for a `GotoTarget`
 #[derive(Debug, Clone)]
-pub(crate) struct Definitions<'db>(pub(crate) Vec<ResolvedDefinition<'db>>);
+pub(crate) struct Definitions<'db> {
+    /// All definitions that this target resolves to.
+    pub(crate) resolved: Vec<ResolvedDefinition<'db>>,
+
+    /// The definition created by this exact target, if this target is a definition site.
+    pub(crate) target_definition: Option<ResolvedDefinition<'db>>,
+}
 
 impl<'db> Definitions<'db> {
+    fn new(
+        resolved: Vec<ResolvedDefinition<'db>>,
+        target_definition: Option<ResolvedDefinition<'db>>,
+    ) -> Self {
+        Self {
+            resolved,
+            target_definition,
+        }
+    }
+
     pub(crate) fn from_ty(db: &'db dyn crate::Db, ty: Type<'db>) -> Option<Self> {
         let ty_def = ty.definition(db)?;
         let resolved = match ty_def {
@@ -263,7 +279,7 @@ impl<'db> Definitions<'db> {
                 ResolvedDefinition::Definition(definition)
             }
         };
-        Some(Definitions(vec![resolved]))
+        Some(Self::new(vec![resolved], None))
     }
 
     /// Apply the "goto declaration" interpretation to these definitions.
@@ -272,7 +288,7 @@ impl<'db> Definitions<'db> {
         model: &SemanticModel<'db>,
         goto_target: &GotoTarget<'_>,
     ) -> Option<Definitions<'db>> {
-        let mut definitions = self.0;
+        let mut definitions = self.resolved;
 
         // When our target is a class constructor, we want to exclude
         // navigation targets to its `__init__` or `__new__` methods.
@@ -315,7 +331,10 @@ impl<'db> Definitions<'db> {
         if definitions.is_empty() {
             None
         } else {
-            Some(Self(definitions))
+            Some(Self {
+                resolved: definitions,
+                target_definition: self.target_definition,
+            })
         }
     }
 
@@ -329,8 +348,11 @@ impl<'db> Definitions<'db> {
         goto_target: &GotoTarget<'_>,
     ) -> Option<Definitions<'db>> {
         let definitions = self.goto_declaration(model, goto_target)?;
-        let definitions = StubMapper::new(model.db()).map_definitions(definitions.0);
-        Some(Self(definitions))
+        let resolved = StubMapper::new(model.db()).map_definitions(definitions.resolved);
+        Some(Self {
+            resolved,
+            target_definition: definitions.target_definition,
+        })
     }
 
     /// Convert these semantic definitions to editor-facing navigation targets.
@@ -338,7 +360,7 @@ impl<'db> Definitions<'db> {
         self,
         db: &'db dyn ty_python_semantic::Db,
     ) -> crate::NavigationTargets {
-        self.0
+        self.resolved
             .into_iter()
             .map(|definition| match definition {
                 ResolvedDefinition::Definition(definition) => {
@@ -368,7 +390,7 @@ impl<'db> Definitions<'db> {
     /// so this will check both the goto-declarations and goto-definitions (in that order)
     /// and return the first one found.
     pub(crate) fn docstring(self, db: &'db dyn crate::Db) -> Option<Docstring> {
-        for definition in &self.0 {
+        for definition in &self.resolved {
             // If we got a docstring from the original definition, use it
             if let Some(docstring) = definition.docstring(db) {
                 return Some(Docstring::new(docstring));
@@ -381,7 +403,7 @@ impl<'db> Definitions<'db> {
         let stub_mapper = StubMapper::new(db);
 
         // Try to find the corresponding implementation definition
-        for definition in stub_mapper.map_definitions(self.0) {
+        for definition in stub_mapper.map_definitions(self.resolved) {
             if let Some(docstring) = definition.docstring(db) {
                 return Some(Docstring::new(docstring));
             }
@@ -405,7 +427,7 @@ pub(crate) fn docstring_for_call_definition<'db>(
     definition: Definition<'db>,
 ) -> Option<Docstring> {
     let resolved = ResolvedDefinition::Definition(definition);
-    Definitions(vec![resolved.clone()])
+    Definitions::new(vec![resolved.clone()], None)
         .docstring(db)
         .or_else(|| resolved.implementation_docstring(db).map(Docstring::new))
 }
@@ -767,7 +789,78 @@ impl GotoTarget<'_> {
             } => typed_dict_key_definition(model, subscript, literal_key)
                 .map(|definition| vec![definition]),
         };
-        definitions.map(Definitions)
+        definitions.map(|definitions| Definitions::new(definitions, self.target_definition(model)))
+    }
+
+    fn target_definition<'db>(
+        &self,
+        model: &SemanticModel<'db>,
+    ) -> Option<ResolvedDefinition<'db>> {
+        if let Some(definition) = self.direct_target_definition(model) {
+            return Some(ResolvedDefinition::Definition(definition));
+        }
+
+        let parsed = ruff_db::parsed::parsed_module(model.db(), model.file());
+        let module = parsed.load(model.db());
+        let covering_node = covering_node(module.syntax().into(), self.range());
+
+        let definition = std::iter::once(covering_node.node())
+            .chain(covering_node.ancestors())
+            .find_map(|node| node.optional_definition(model))?;
+
+        Some(ResolvedDefinition::Definition(definition))
+    }
+
+    fn direct_target_definition<'db>(&self, model: &SemanticModel<'db>) -> Option<Definition<'db>> {
+        match self {
+            GotoTarget::Expression(expression)
+            | GotoTarget::Call {
+                callable: expression,
+                ..
+            } => expression.optional_definition(model),
+            GotoTarget::FunctionDef(function) => Some(function.definition(model)),
+            GotoTarget::ClassDef(class) => Some(class.definition(model)),
+            GotoTarget::Parameter(parameter) => Some(parameter.definition(model)),
+            GotoTarget::ExceptVariable(except) => except.optional_definition(model),
+            GotoTarget::TypeParamTypeVarName(type_var) => Some(type_var.definition(model)),
+            GotoTarget::PatternMatchRest(pattern_mapping) => pattern_mapping
+                .rest
+                .as_ref()
+                .and_then(|identifier| AnyNodeRef::from(identifier).optional_definition(model)),
+            GotoTarget::PatternKeywordArgument(pattern_keyword) => {
+                AnyNodeRef::from(&pattern_keyword.attr).optional_definition(model)
+            }
+            GotoTarget::PatternMatchStarName(pattern_star) => pattern_star
+                .name
+                .as_ref()
+                .and_then(|identifier| AnyNodeRef::from(identifier).optional_definition(model)),
+            GotoTarget::PatternMatchAsName(pattern_as) => pattern_as
+                .name
+                .as_ref()
+                .and_then(|identifier| AnyNodeRef::from(identifier).optional_definition(model)),
+            GotoTarget::TypeParamParamSpecName(param_spec) => {
+                AnyNodeRef::from(*param_spec).optional_definition(model)
+            }
+            GotoTarget::TypeParamTypeVarTupleName(type_var_tuple) => {
+                AnyNodeRef::from(*type_var_tuple).optional_definition(model)
+            }
+            GotoTarget::ImportModuleAlias { asname, .. }
+            | GotoTarget::ImportSymbolAlias { asname, .. } => {
+                AnyNodeRef::from(*asname).optional_definition(model)
+            }
+            GotoTarget::ImportExportedName { alias, .. } => {
+                AnyNodeRef::from(&alias.name).optional_definition(model)
+            }
+            GotoTarget::NonLocal { identifier } | GotoTarget::Globals { identifier } => {
+                AnyNodeRef::from(*identifier).optional_definition(model)
+            }
+            GotoTarget::KeywordArgument { .. }
+            | GotoTarget::ImportModuleComponent { .. }
+            | GotoTarget::StringAnnotationSubexpr { .. }
+            | GotoTarget::BinOp { .. }
+            | GotoTarget::UnaryOp { .. }
+            | GotoTarget::SubscriptStringLiteralKey { .. } => None,
+        }
     }
 
     /// Returns the text representation of this goto target.

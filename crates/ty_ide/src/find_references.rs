@@ -1972,7 +1972,7 @@ print(x)
     }
 
     #[test]
-    fn references_without_declaration_excludes_repeated_annotated_assignment() {
+    fn references_without_declaration_keeps_repeated_annotated_assignment() {
         let test = cursor_test(
             "
 x<CURSOR>: int = 10
@@ -1982,9 +1982,13 @@ print(x)
         );
 
         assert_snapshot!(test.references_without_declaration(), @"
-        info[references]: Found 1 references
-         --> main.py:4:7
+        info[references]: Found 3 references
+         --> main.py:2:1
           |
+        2 | x: int = 10
+          | -
+        3 | x: str = \"test\"
+          | -
         4 | print(x)
           |       -
           |
@@ -1992,7 +1996,7 @@ print(x)
     }
 
     #[test]
-    fn references_without_declaration_excludes_annotated_assignment() {
+    fn references_without_declaration_keeps_annotated_assignment() {
         let test = cursor_test(
             "
 x<CURSOR>: int = 1
@@ -2001,9 +2005,11 @@ print(x)
         );
 
         assert_snapshot!(test.references_without_declaration(), @"
-        info[references]: Found 1 references
-         --> main.py:3:7
+        info[references]: Found 2 references
+         --> main.py:2:1
           |
+        2 | x: int = 1
+          | -
         3 | print(x)
           |       -
           |
@@ -2152,12 +2158,52 @@ print(x)
         );
 
         assert_snapshot!(test.references_without_declaration(), @"
-        info[references]: Found 2 references
-         --> main.py:5:5
+        info[references]: Found 1 references
+         --> main.py:6:7
           |
-        5 |     x = 2
-          |     -
         6 | print(x)
+          |       -
+          |
+        ");
+    }
+
+    #[test]
+    fn references_without_declaration_excludes_live_conditional_assignments() {
+        let test = cursor_test(
+            "
+if flag:
+    x = 1
+else:
+    x = 2
+print(x<CURSOR>)
+",
+        );
+
+        assert_snapshot!(test.references_without_declaration(), @"
+        info[references]: Found 1 references
+         --> main.py:6:7
+          |
+        6 | print(x)
+          |       -
+          |
+        ");
+    }
+
+    #[test]
+    fn references_without_declaration_excludes_only_live_sequential_assignment() {
+        let test = cursor_test(
+            "
+x = 1
+x = 2
+print(x<CURSOR>)
+",
+        );
+
+        assert_snapshot!(test.references_without_declaration(), @"
+        info[references]: Found 1 references
+         --> main.py:4:7
+          |
+        4 | print(x)
           |       -
           |
         ");
@@ -2203,13 +2249,9 @@ class C:
         );
 
         assert_snapshot!(test.references_without_declaration(), @"
-        info[references]: Found 2 references
-          --> main.py:7:18
+        info[references]: Found 1 references
+          --> main.py:10:20
            |
-         7 |             self.x = 2
-           |                  -
-         8 |
-         9 |     def f(self):
         10 |         print(self.x)
            |                    -
            |

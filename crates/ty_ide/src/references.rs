@@ -19,9 +19,8 @@
 //!
 //! The flow is:
 //! 1. Resolve the symbol under the cursor to raw semantic definitions.
-//! 2. Apply goto-declaration policy, then convert the resulting definitions
-//!    into [`DefinitionMatches`], keeping the
-//!    semantic key plus the source ranges needed by find-references.
+//! 2. Keep the resulting semantic definitions as the identity set for
+//!    find-references.
 //! 3. Visit candidate occurrences and resolve each occurrence the same way.
 //! 4. Treat the occurrence as a match when the two identity sets intersect.
 //!
@@ -42,7 +41,7 @@ use ruff_python_ast::{
     visitor::source_order::{SourceOrderVisitor, TraversalSignal},
 };
 use ruff_text_size::Ranged;
-use ty_python_semantic::{ImportAliasResolution, ResolvedDefinition, SemanticModel};
+use ty_python_semantic::{ImportAliasResolution, SemanticModel};
 
 /// Mode for references search behavior
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,13 +99,7 @@ pub(crate) fn references(
     mode: ReferencesMode,
 ) -> Option<Vec<ReferenceTarget>> {
     let model = SemanticModel::new(db, file);
-    let target_definitions = goto_target
-        .definitions(&model, mode.to_import_alias_resolution())?
-        .goto_declaration(&model, goto_target)?;
-    let target_definitions = DefinitionMatches::new(
-        FileRange::new(file, goto_target.range()),
-        target_definitions,
-    );
+    let target_definitions = goto_target.definitions(&model, mode.to_import_alias_resolution())?;
 
     // Extract the target text from the goto target for fast comparison
     let target_text = goto_target.to_string()?;
@@ -190,7 +183,7 @@ pub(crate) fn references(
 fn references_for_parameter_keyword_arguments_across_files(
     db: &dyn Db,
     file: File,
-    target_definitions: &DefinitionMatches<'_>,
+    target_definitions: &Definitions<'_>,
     target_text: &str,
     mode: ReferencesMode,
     references: &mut Vec<ReferenceTarget>,
@@ -219,7 +212,7 @@ fn references_for_parameter_keyword_arguments_across_files(
 fn references_for_keyword_arguments_in_file(
     db: &dyn Db,
     file: File,
-    target_definitions: &DefinitionMatches<'_>,
+    target_definitions: &Definitions<'_>,
     target_text: &str,
     mode: ReferencesMode,
     references: &mut Vec<ReferenceTarget>,
@@ -295,7 +288,7 @@ fn source_contains_keyword_argument_candidate(source: &str, name: &str) -> bool 
 fn references_for_file(
     db: &dyn Db,
     file: File,
-    target_definitions: &DefinitionMatches,
+    target_definitions: &Definitions<'_>,
     target_text: &str,
     mode: ReferencesMode,
     references: &mut Vec<ReferenceTarget>,
@@ -341,9 +334,10 @@ fn is_symbol_externally_visible(goto_target: &GotoTarget<'_>) -> bool {
 /// when the owning callable is visible outside of the current module.
 fn parameter_owner_is_externally_visible(
     db: &dyn Db,
-    target_definitions: &DefinitionMatches<'_>,
+    target_definitions: &Definitions<'_>,
 ) -> bool {
     target_definitions
+        .resolved
         .iter()
         .any(|target| parameter_owner_is_externally_visible_for_target(db, target.focus_range(db)))
 }
@@ -398,74 +392,27 @@ fn parameter_owner_is_externally_visible_for_target(db: &dyn Db, target: FileRan
     matches!(owner, Some(AnyNodeRef::StmtFunctionDef(_)))
 }
 
-/// The resolved definitions for one candidate occurrence in a reference search.
+/// Return true if the semantic identity sets intersect.
 ///
-/// Most symbols resolve to a single target, but overload groups, properties,
-/// imports, and other compound cases can produce multiple co-definitions. A
-/// candidate matches when this set intersects with the original target's set by
-/// [`ResolvedDefinition`].
-#[derive(Debug, Clone)]
-struct DefinitionMatches<'db> {
-    /// The range of the occurrence that produced these targets.
-    ///
-    /// This is not the declaration range. It is the syntax range currently being
-    /// visited, and is used to decide whether a store occurrence is the
-    /// declaration that should be skipped in `ReferencesSkipDeclaration` mode.
-    origin: FileRange,
-
-    /// The semantic definitions this occurrence resolves to.
-    targets: Vec<ResolvedDefinition<'db>>,
+/// A symbol can resolve to multiple definitions (for example, overload groups,
+/// property getter/setter co-definitions, or an import binding plus its
+/// underlying definition). Intersection semantics avoid missing valid
+/// references/renames when target ordering differs or when one occurrence
+/// exposes only part of the co-definition set.
+fn definitions_intersect(left: &Definitions<'_>, right: &Definitions<'_>) -> bool {
+    left.resolved
+        .iter()
+        .any(|definition| right.resolved.contains(definition))
 }
 
-impl<'db> DefinitionMatches<'db> {
-    fn new(origin: FileRange, definitions: Definitions<'db>) -> Self {
-        Self {
-            origin,
-            targets: definitions.0,
-        }
-    }
-
-    fn iter(&self) -> std::slice::Iter<'_, ResolvedDefinition<'db>> {
-        self.targets.iter()
-    }
-
-    /// Return true if the semantic identity sets intersect.
-    ///
-    /// A symbol can resolve to multiple definitions (for example, overload groups,
-    /// property getter/setter co-definitions, or an import binding plus its
-    /// underlying definition). Intersection semantics avoid missing valid
-    /// references/renames when target ordering differs or when one occurrence
-    /// exposes only part of the co-definition set.
-    fn intersects(&self, other: &DefinitionMatches<'_>) -> bool {
-        self.iter()
-            .any(|target_definition| other.targets.contains(target_definition))
-    }
-
-    fn declarations(
-        &self,
-        db: &'db dyn ty_python_semantic::Db,
-    ) -> impl Iterator<Item = &ResolvedDefinition<'db>> {
-        let has_semantic_declaration = self
-            .targets
-            .iter()
-            .any(|target| target.category(db).is_declaration());
-        let first_binding = self
-            .targets
-            .iter()
-            .filter(|target| target.category(db).is_binding())
-            .min_by_key(|target| {
-                let focus = target.focus_range(db);
-                (focus.file(), focus.range().start())
-            });
-
-        self.targets.iter().filter(move |target| {
-            if has_semantic_declaration {
-                target.category(db).is_declaration()
-            } else {
-                first_binding.is_some_and(|first_binding| first_binding == *target)
-            }
-        })
-    }
+fn definitions_have_explicit_declaration(
+    definitions: &Definitions<'_>,
+    db: &dyn ty_python_semantic::Db,
+) -> bool {
+    definitions
+        .resolved
+        .iter()
+        .any(|definition| definition.category(db).is_declaration())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,7 +450,7 @@ impl From<ast::ExprContext> for OccurrenceKind {
 struct LocalReferencesFinder<'a> {
     model: &'a SemanticModel<'a>,
     tokens: &'a Tokens,
-    target_definitions: &'a DefinitionMatches<'a>,
+    target_definitions: &'a Definitions<'a>,
     references: &'a mut Vec<ReferenceTarget>,
     mode: ReferencesMode,
     target_text: &'a str,
@@ -681,7 +628,7 @@ impl<'a> LocalReferencesFinder<'a> {
     fn definitions_for_covering_node(
         &self,
         covering_node: &CoveringNode<'_>,
-    ) -> Option<DefinitionMatches<'a>> {
+    ) -> Option<Definitions<'a>> {
         // Use the start of the covering node as the offset. Any offset within
         // the node is fine here. Offsets matter only for import statements
         // where the identifier might be a multi-part module name.
@@ -689,14 +636,7 @@ impl<'a> LocalReferencesFinder<'a> {
         let goto_target =
             GotoTarget::from_covering_node(self.model, covering_node, offset, self.tokens)?;
 
-        let definitions = goto_target
-            .definitions(self.model, self.mode.to_import_alias_resolution())?
-            .goto_declaration(self.model, &goto_target)?;
-
-        Some(DefinitionMatches::new(
-            FileRange::new(self.model.file(), goto_target.range()),
-            definitions,
-        ))
+        goto_target.definitions(self.model, self.mode.to_import_alias_resolution())
     }
 
     /// Resolves `covering_node` and records it if it refers to the target symbol.
@@ -710,20 +650,16 @@ impl<'a> LocalReferencesFinder<'a> {
         };
 
         // Check if any of the current definitions match our target definitions
-        if !self.target_definitions.intersects(&current_definitions) {
+        if !definitions_intersect(self.target_definitions, &current_definitions) {
             return;
         }
 
-        if matches!(self.mode, ReferencesMode::ReferencesSkipDeclaration) {
-            let is_declaration = match kind {
-                OccurrenceKind::Reference => false,
-                OccurrenceKind::Declaration => true,
-                OccurrenceKind::Store => self.is_declaration_occurrence(&current_definitions),
-            };
-
-            if is_declaration {
-                return;
-            }
+        if matches!(self.mode, ReferencesMode::ReferencesSkipDeclaration)
+            && (matches!(kind, OccurrenceKind::Declaration)
+                || matches!(kind, OccurrenceKind::Store)
+                    && self.is_declaration_store(&current_definitions))
+        {
+            return;
         }
 
         let target = ReferenceTarget::new(
@@ -734,16 +670,16 @@ impl<'a> LocalReferencesFinder<'a> {
         self.references.push(target);
     }
 
-    /// Returns true if this store occurrence is the declaration to omit.
-    fn is_declaration_occurrence(&self, current_definitions: &DefinitionMatches<'_>) -> bool {
-        self.target_definitions
-            .declarations(self.model.db())
-            .any(|target_declaration| {
-                let declaration_range = target_declaration.focus_range(self.model.db());
-                declaration_range.file() == current_definitions.origin.file()
-                    && declaration_range
-                        .range()
-                        .contains_range(current_definitions.origin.range())
+    fn is_declaration_store(&self, current_definitions: &Definitions<'_>) -> bool {
+        let db = self.model.db();
+
+        current_definitions
+            .target_definition
+            .as_ref()
+            .is_some_and(|definition| {
+                let category = definition.category(db);
+                category.is_declaration() && !category.is_binding()
             })
+            || !definitions_have_explicit_declaration(self.target_definitions, db)
     }
 }

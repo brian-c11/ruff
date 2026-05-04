@@ -17,7 +17,7 @@ use crate::types::list_members::{Member, all_members, all_reachable_members};
 use crate::types::{
     CycleDetector, Type, TypeQualifiers, binding_type, declaration_type, infer_complete_scope_types,
 };
-use ty_python_core::definition::Definition;
+use ty_python_core::definition::{Definition, DefinitionNodeKey};
 use ty_python_core::place_table;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
@@ -599,6 +599,79 @@ pub trait HasOptionalDefinition {
     /// ## Panics
     /// May panic if `self` is from another file than `model`.
     fn optional_definition<'db>(&self, model: &SemanticModel<'db>) -> Option<Definition<'db>>;
+}
+
+fn optional_definition_for_key<'db>(
+    model: &SemanticModel<'db>,
+    key: impl Into<DefinitionNodeKey> + std::fmt::Debug + Copy,
+) -> Option<Definition<'db>> {
+    semantic_index(model.db, model.file).try_single_definition(key)
+}
+
+impl HasOptionalDefinition for ast::AnyNodeRef<'_> {
+    fn optional_definition<'db>(&self, model: &SemanticModel<'db>) -> Option<Definition<'db>> {
+        match *self {
+            ast::AnyNodeRef::ExprName(name) => ast::ExprRef::Name(name).optional_definition(model),
+            ast::AnyNodeRef::ExprAttribute(attribute) => {
+                ast::ExprRef::Attribute(attribute).optional_definition(model)
+            }
+            ast::AnyNodeRef::ExprSubscript(subscript) => {
+                ast::ExprRef::Subscript(subscript).optional_definition(model)
+            }
+            ast::AnyNodeRef::ExprNamed(named) => {
+                ast::ExprRef::Named(named).optional_definition(model)
+            }
+            ast::AnyNodeRef::StmtAnnAssign(ann_assign) => {
+                optional_definition_for_key(model, ann_assign)
+            }
+            ast::AnyNodeRef::StmtAugAssign(aug_assign) => {
+                optional_definition_for_key(model, aug_assign)
+            }
+            ast::AnyNodeRef::StmtClassDef(class) => optional_definition_for_key(model, class),
+            ast::AnyNodeRef::StmtFunctionDef(function) => {
+                optional_definition_for_key(model, function)
+            }
+            ast::AnyNodeRef::StmtFor(for_stmt) => optional_definition_for_key(model, for_stmt),
+            ast::AnyNodeRef::StmtTypeAlias(type_alias) => {
+                optional_definition_for_key(model, type_alias)
+            }
+            ast::AnyNodeRef::StmtWhile(while_stmt) => {
+                optional_definition_for_key(model, while_stmt)
+            }
+            ast::AnyNodeRef::Parameter(parameter) => optional_definition_for_key(model, parameter),
+            ast::AnyNodeRef::ParameterWithDefault(parameter) => {
+                optional_definition_for_key(model, parameter)
+            }
+            ast::AnyNodeRef::Identifier(identifier) => {
+                optional_definition_for_key(model, identifier)
+            }
+            ast::AnyNodeRef::ExceptHandlerExceptHandler(handler) => {
+                handler.optional_definition(model)
+            }
+            ast::AnyNodeRef::TypeParamTypeVar(type_var) => {
+                optional_definition_for_key(model, type_var)
+            }
+            ast::AnyNodeRef::TypeParamParamSpec(param_spec) => {
+                optional_definition_for_key(model, param_spec)
+            }
+            ast::AnyNodeRef::TypeParamTypeVarTuple(type_var_tuple) => {
+                optional_definition_for_key(model, type_var_tuple)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl HasOptionalDefinition for ast::ExprRef<'_> {
+    fn optional_definition<'db>(&self, model: &SemanticModel<'db>) -> Option<Definition<'db>> {
+        match *self {
+            ast::ExprRef::Name(name) => optional_definition_for_key(model, name),
+            ast::ExprRef::Attribute(attribute) => optional_definition_for_key(model, attribute),
+            ast::ExprRef::Subscript(subscript) => optional_definition_for_key(model, subscript),
+            ast::ExprRef::Named(named) => optional_definition_for_key(model, named),
+            _ => None,
+        }
+    }
 }
 
 impl HasType for ast::ExprRef<'_> {
