@@ -256,9 +256,23 @@ pub(crate) struct ApplyTypeMappingVisitor<'db> {
     top_materialization: OnceCell<TypeTransformer<'db, ApplyTopMaterialization>>,
     bottom_materialization: OnceCell<TypeTransformer<'db, ApplyBottomMaterialization>>,
     materialization_equivalence: OnceCell<MaterializationEquivalenceVisitor<'db>>,
+    /// Whether union rebuilding during this mapping may ask the type-relation layer for
+    /// redundancy and subtype checks.
+    relation_based_union_simplification: bool,
 }
 
 impl<'db> ApplyTypeMappingVisitor<'db> {
+    fn without_relation_based_union_simplification() -> Self {
+        Self {
+            relation_based_union_simplification: false,
+            ..Self::default()
+        }
+    }
+
+    const fn relation_based_union_simplification(&self) -> bool {
+        self.relation_based_union_simplification
+    }
+
     fn materialization_equivalence(&self) -> &MaterializationEquivalenceVisitor<'db> {
         self.materialization_equivalence
             .get_or_init(|| Rc::new(CycleDetector::new(true)))
@@ -309,6 +323,7 @@ impl<'db> ApplyTypeMappingVisitor<'db> {
             top_materialization: OnceCell::new(),
             bottom_materialization: OnceCell::new(),
             materialization_equivalence,
+            relation_based_union_simplification: self.relation_based_union_simplification,
         }
     }
 }
@@ -320,6 +335,7 @@ impl Default for ApplyTypeMappingVisitor<'_> {
             top_materialization: OnceCell::new(),
             bottom_materialization: OnceCell::new(),
             materialization_equivalence: OnceCell::new(),
+            relation_based_union_simplification: true,
         }
     }
 }
@@ -5606,23 +5622,47 @@ impl<'db> Type<'db> {
         }
     }
 
+    pub(super) fn apply_optional_specialization_for_protocol_interface(
+        self,
+        db: &'db dyn Db,
+        specialization: Option<Specialization<'db>>,
+    ) -> Type<'db> {
+        // Protocol interfaces are a structural view of declarations. Using relation-based union
+        // simplification here can recursively force interfaces for ever-growing generic protocol
+        // specializations before protocol-member recursion guards are active.
+        if let Some(specialization) = specialization {
+            self.apply_specialization_inner(db, specialization, false)
+        } else {
+            self
+        }
+    }
+
     /// Applies a specialization to this type, replacing any typevars with the types that they are
     /// specialized to.
     ///
     /// Note that this does not specialize generic classes, functions, or type aliases! That is a
     /// different operation that is performed explicitly (via a subscript operation), or implicitly
     /// via a call to the generic object.
-    #[salsa::tracked(
-        cycle_initial=|_, id, _, _| Type::divergent(id),
-        cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, _| {
-            value.cycle_normalized(db, *previous, cycle)
-        },
-        heap_size=ruff_memory_usage::heap_size
-    )]
     pub(crate) fn apply_specialization(
         self,
         db: &'db dyn Db,
         specialization: Specialization<'db>,
+    ) -> Type<'db> {
+        self.apply_specialization_inner(db, specialization, true)
+    }
+
+    #[salsa::tracked(
+        cycle_initial=|_, id, _, _, _| Type::divergent(id),
+        cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, _, _| {
+            value.cycle_normalized(db, *previous, cycle)
+        },
+        heap_size=ruff_memory_usage::heap_size
+    )]
+    fn apply_specialization_inner(
+        self,
+        db: &'db dyn Db,
+        specialization: Specialization<'db>,
+        relation_based_union_simplification: bool,
     ) -> Type<'db> {
         let type_mapping = match specialization.materialization_kind(db) {
             None => TypeMapping::ApplySpecialization(ApplySpecialization::Specialization(
@@ -5634,7 +5674,12 @@ impl<'db> Type<'db> {
             },
         };
 
-        self.apply_type_mapping(db, &type_mapping, TypeContext::default())
+        let visitor = if relation_based_union_simplification {
+            ApplyTypeMappingVisitor::default()
+        } else {
+            ApplyTypeMappingVisitor::without_relation_based_union_simplification()
+        };
+        self.apply_type_mapping_impl(db, &type_mapping, TypeContext::default(), &visitor)
     }
 
     fn apply_type_mapping<'a>(
@@ -5787,9 +5832,22 @@ impl<'db> Type<'db> {
                 Type::PropertyInstance(property.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
             }
 
-            Type::Union(union) => union.map_leave_aliases(db, |element| {
-                element.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
-            }),
+            Type::Union(union) => {
+                union
+                    .elements(db)
+                    .iter()
+                    .map(|element| element.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
+                    .fold(
+                        UnionBuilder::new(db)
+                            .unpack_aliases(false)
+                            .relation_based_simplification(
+                                visitor.relation_based_union_simplification(),
+                            ),
+                        UnionBuilder::add,
+                    )
+                    .recursively_defined(union.recursively_defined(db))
+                    .build()
+            },
             Type::Intersection(intersection) => {
                 let mut builder = IntersectionBuilder::new(db);
                 for positive in intersection.positive(db) {

@@ -36,19 +36,15 @@
 //! shares exactly the same possible super-types, and none of them are subtypes of each other
 //! (unless exactly the same literal type), we can avoid many unnecessary redundancy checks.
 
-use std::cell::{Cell, RefCell};
-
 use super::RecursivelyDefined;
 use crate::types::enums::{enum_member_literals, enum_metadata};
 use crate::types::set_theoretic::expand_intersection_typevars_and_newtypes;
-use crate::types::visitor::{TypeKind, TypeVisitor, walk_non_atomic_type};
 use crate::types::{
     BytesLiteralType, ClassLiteral, EnumLiteralType, IntersectionType, KnownClass,
     LiteralValueType, LiteralValueTypeKind, NegativeIntersectionElements, StringLiteralType, Type,
     TypeVarBoundOrConstraints, UnionType,
 };
 use crate::{Db, FxOrderMap, FxOrderSet};
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 /// Extract `(core, guard)` from truthiness-guarded intersections.
@@ -142,108 +138,40 @@ fn is_generic_protocol_instance<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
         .is_some_and(|(_, specialization)| specialization.is_some())
 }
 
-fn can_contain_generic_protocol_instance(ty: Type) -> bool {
-    if let Type::NominalInstance(instance) = ty {
-        return instance.is_definition_generic();
-    }
+#[derive(Debug, Clone, Copy)]
+struct RelationBasedUnionSimplification {
+    enabled: bool,
+}
 
-    match TypeKind::from(ty) {
-        TypeKind::Atomic => false,
-        TypeKind::NonAtomic(_) => true,
+impl Default for RelationBasedUnionSimplification {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
-#[derive(Debug, Default)]
-struct RelationBasedUnionSimplification<'db> {
-    generic_protocol_cache: RefCell<FxHashMap<Type<'db>, bool>>,
-    active_generic_protocol_search: RefCell<FxHashSet<Type<'db>>>,
-}
-
-struct ContainsGenericProtocolVisitor<'a, 'db> {
-    relation_simplification: &'a RelationBasedUnionSimplification<'db>,
-    found: Cell<bool>,
-}
-
-impl<'a, 'db> ContainsGenericProtocolVisitor<'a, 'db> {
-    const fn new(relation_simplification: &'a RelationBasedUnionSimplification<'db>) -> Self {
-        Self {
-            relation_simplification,
-            found: Cell::new(false),
-        }
-    }
-}
-
-impl<'db> TypeVisitor<'db> for ContainsGenericProtocolVisitor<'_, 'db> {
-    fn should_visit_lazy_type_attributes(&self) -> bool {
-        false
+impl RelationBasedUnionSimplification {
+    const fn disabled() -> Self {
+        Self { enabled: false }
     }
 
-    fn should_visit_type_aliases(&self) -> bool {
-        true
-    }
-
-    fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
-        if !self.found.get()
-            && self
-                .relation_simplification
-                .contains_generic_protocol_instance(db, ty)
-        {
-            self.found.set(true);
-        }
-    }
-}
-
-impl<'db> RelationBasedUnionSimplification<'db> {
     /// Return `true` if union normalization may ask the relation layer about this pair.
     ///
     /// Generic protocol interface construction can recurse through ever-growing specializations
-    /// even when the protocol is nested inside a union element. Non-generic protocol cycles are
-    /// handled by Salsa cycle recovery.
-    fn can_use(&self, db: &'db dyn Db, left: Type<'db>, right: Type<'db>) -> bool {
-        !self.contains_generic_protocol_instance(db, left)
-            && !self.contains_generic_protocol_instance(db, right)
+    /// when a generic protocol is one side of the relation. Non-generic protocol cycles are
+    /// handled by Salsa cycle recovery, and protocol-interface construction disables relation-based
+    /// union simplification before nested generic protocols can force ever-growing interfaces.
+    fn can_use<'db>(self, db: &'db dyn Db, left: Type<'db>, right: Type<'db>) -> bool {
+        self.enabled
+            && !is_generic_protocol_instance(db, left)
+            && !is_generic_protocol_instance(db, right)
     }
 
-    fn is_redundant(&self, db: &'db dyn Db, left: Type<'db>, right: Type<'db>) -> bool {
+    fn is_redundant<'db>(self, db: &'db dyn Db, left: Type<'db>, right: Type<'db>) -> bool {
         self.can_use(db, left, right) && left.is_redundant_with(db, right)
     }
 
-    fn is_subtype(&self, db: &'db dyn Db, left: Type<'db>, right: Type<'db>) -> bool {
+    fn is_subtype<'db>(self, db: &'db dyn Db, left: Type<'db>, right: Type<'db>) -> bool {
         self.can_use(db, left, right) && left.is_subtype_of(db, right)
-    }
-
-    fn contains_generic_protocol_instance(&self, db: &'db dyn Db, ty: Type<'db>) -> bool {
-        if !can_contain_generic_protocol_instance(ty) {
-            return false;
-        }
-
-        if let Some(contains) = self.generic_protocol_cache.borrow().get(&ty) {
-            return *contains;
-        }
-
-        if is_generic_protocol_instance(db, ty) {
-            self.generic_protocol_cache.borrow_mut().insert(ty, true);
-            return true;
-        }
-
-        if !self.active_generic_protocol_search.borrow_mut().insert(ty) {
-            return false;
-        }
-
-        let contains = match TypeKind::from(ty) {
-            TypeKind::Atomic => false,
-            TypeKind::NonAtomic(non_atomic) => {
-                let visitor = ContainsGenericProtocolVisitor::new(self);
-                walk_non_atomic_type(db, non_atomic, &visitor);
-                visitor.found.get()
-            }
-        };
-
-        self.active_generic_protocol_search.borrow_mut().remove(&ty);
-        self.generic_protocol_cache
-            .borrow_mut()
-            .insert(ty, contains);
-        contains
     }
 }
 
@@ -330,7 +258,7 @@ impl<'db> UnionElement<'db> {
     fn try_reduce(
         &mut self,
         db: &'db dyn Db,
-        relation_simplification: &mut RelationBasedUnionSimplification<'db>,
+        relation_simplification: RelationBasedUnionSimplification,
         other_type: Type<'db>,
     ) -> ReduceResult<'db> {
         let mut other_type_negated_cache = None;
@@ -466,7 +394,7 @@ const MAX_NON_RECURSIVE_UNION_ENUM_LITERALS: usize = 8192;
 pub(crate) struct UnionBuilder<'db> {
     elements: Vec<UnionElement<'db>>,
     db: &'db dyn Db,
-    relation_simplification: RelationBasedUnionSimplification<'db>,
+    relation_simplification: RelationBasedUnionSimplification,
     unpack_aliases: bool,
     /// This is enabled when joining types in a `cycle_recovery` function.
     /// Since a cycle cannot be created within a `cycle_recovery` function,
@@ -552,7 +480,17 @@ impl<'db> UnionBuilder<'db> {
         self.cycle_recovery = val;
         if self.cycle_recovery {
             self.unpack_aliases = false;
+            self.relation_simplification = RelationBasedUnionSimplification::disabled();
         }
+        self
+    }
+
+    pub(crate) fn relation_based_simplification(mut self, val: bool) -> Self {
+        self.relation_simplification = if val {
+            RelationBasedUnionSimplification::default()
+        } else {
+            RelationBasedUnionSimplification::disabled()
+        };
         self
     }
 
@@ -966,23 +904,22 @@ impl<'db> UnionBuilder<'db> {
         let mut to_remove = SmallVec::<[usize; 2]>::new();
 
         for (i, element) in self.elements.iter_mut().enumerate() {
-            let element_type =
-                match element.try_reduce(self.db, &mut self.relation_simplification, ty) {
-                    ReduceResult::KeepIf(keep) => {
-                        if !keep {
-                            to_remove.push(i);
-                        }
-                        continue;
+            let element_type = match element.try_reduce(self.db, self.relation_simplification, ty) {
+                ReduceResult::KeepIf(keep) => {
+                    if !keep {
+                        to_remove.push(i);
                     }
-                    ReduceResult::Type(ty) => ty,
-                    ReduceResult::CollapseToObject => {
-                        self.collapse_to_object();
-                        return;
-                    }
-                    ReduceResult::Ignore => {
-                        return;
-                    }
-                };
+                    continue;
+                }
+                ReduceResult::Type(ty) => ty,
+                ReduceResult::CollapseToObject => {
+                    self.collapse_to_object();
+                    return;
+                }
+                ReduceResult::Ignore => {
+                    return;
+                }
+            };
 
             if ty == element_type {
                 return;
